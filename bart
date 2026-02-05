@@ -52,6 +52,14 @@ step()    { printf "  ${DIM}→${RESET} %s\n" "$1"; }
 
 # ── Utility Functions ──────────────────────────────────────────────────────────
 
+require_tty() {
+  if [[ ! -t 0 ]]; then
+    error "This command requires an interactive terminal."
+    error "Please run './bart ${1:-}' directly in your terminal."
+    exit 1
+  fi
+}
+
 confirm() {
   local prompt="${1:-Continue?}"
   printf "  ${YELLOW}?${RESET} %s [Y/n] " "$prompt"
@@ -353,6 +361,7 @@ step_clone_repos() {
 # ── Commands ───────────────────────────────────────────────────────────────────
 
 cmd_init() {
+  require_tty init
   printf "\n  ${BOLD}${CYAN}bart init${RESET}\n"
   printf "  ${DIM}Bartlett workspace setup${RESET}\n"
 
@@ -375,6 +384,7 @@ cmd_init() {
 }
 
 cmd_reset() {
+  require_tty reset
   printf "\n  ${BOLD}${RED}bart reset${RESET}\n"
   printf "  ${DIM}Remove all cloned repos, skills symlinks, and config${RESET}\n"
 
@@ -464,6 +474,7 @@ cmd_clone() {
   local target="${1:-}"
 
   if [[ -z "$target" ]]; then
+    require_tty clone
     # No argument — show interactive picker
     printf "\n  ${BOLD}${CYAN}bart clone${RESET}\n"
     printf "  ${DIM}Select a repository to clone${RESET}\n\n"
@@ -530,6 +541,7 @@ cmd_clone() {
 }
 
 cmd_rm() {
+  require_tty rm
   local target="${1:-}"
 
   if [[ -z "$target" ]]; then
