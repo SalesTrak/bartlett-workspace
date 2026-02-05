@@ -1,0 +1,7 @@
+# Cloned repo directories
+salestrak-monorepo/
+bartlett-component-library/
+design-prototypes/
+
+# Workspace config
+.bart

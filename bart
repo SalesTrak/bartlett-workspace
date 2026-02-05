@@ -1,0 +1,650 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Constants & Configuration ──────────────────────────────────────────────────
+
+WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${WORKSPACE_DIR}/.bart"
+CLAUDE_DIR="${WORKSPACE_DIR}/.claude"
+CLAUDE_SKILLS_DIR="${CLAUDE_DIR}/skills"
+
+ALL_REPOS="salestrak-monorepo bartlett-component-library design-prototypes"
+VALID_ROLES=("developer" "designer" "manager" "executive")
+
+get_repos_for_role() {
+  case "$1" in
+    developer)  echo "salestrak-monorepo bartlett-component-library design-prototypes" ;;
+    designer)   echo "bartlett-component-library design-prototypes" ;;
+    manager)    echo "bartlett-component-library" ;;
+    executive)  echo "bartlett-component-library" ;;
+  esac
+}
+
+get_full_repo() {
+  case "$1" in
+    salestrak-monorepo)         echo "SalesTrak/salestrak-monorepo" ;;
+    bartlett-component-library) echo "SalesTrak/bartlett-component-library" ;;
+    design-prototypes)          echo "SalesTrak/design-prototypes" ;;
+  esac
+}
+
+# ── Color & Output Helpers ─────────────────────────────────────────────────────
+
+if [[ -t 1 ]]; then
+  RED='\033[0;31m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[1;33m'
+  BLUE='\033[0;34m'
+  CYAN='\033[0;36m'
+  BOLD='\033[1m'
+  DIM='\033[2m'
+  RESET='\033[0m'
+else
+  RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' RESET=''
+fi
+
+header()  { printf "\n${BOLD}${BLUE}══ %s ══${RESET}\n\n" "$1"; }
+info()    { printf "  ${CYAN}>${RESET} %s\n" "$1"; }
+success() { printf "  ${GREEN}✓${RESET} %s\n" "$1"; }
+warn()    { printf "  ${YELLOW}!${RESET} %s\n" "$1"; }
+error()   { printf "  ${RED}✗${RESET} %s\n" "$1"; }
+step()    { printf "  ${DIM}→${RESET} %s\n" "$1"; }
+
+# ── Utility Functions ──────────────────────────────────────────────────────────
+
+confirm() {
+  local prompt="${1:-Continue?}"
+  printf "  ${YELLOW}?${RESET} %s [Y/n] " "$prompt"
+  read -r response
+  [[ -z "$response" || "$response" =~ ^[Yy] ]]
+}
+
+config_get() {
+  local key="$1"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    grep "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- || true
+  fi
+}
+
+config_set() {
+  local key="$1" value="$2"
+  if [[ -f "$CONFIG_FILE" ]] && grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+    local tmp="${CONFIG_FILE}.tmp"
+    sed "s|^${key}=.*|${key}=${value}|" "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+  else
+    echo "${key}=${value}" >> "$CONFIG_FILE"
+  fi
+}
+
+# ── Step 1: Ask Role ──────────────────────────────────────────────────────────
+
+step_ask_role() {
+  header "Role Selection"
+
+  local existing_role
+  existing_role=$(config_get role)
+
+  if [[ -n "$existing_role" ]]; then
+    info "Current role: ${BOLD}${existing_role}${RESET}"
+    if ! confirm "Change your role?"; then
+      success "Keeping role: ${existing_role}"
+      return
+    fi
+  fi
+
+  printf "  Select your role:\n\n"
+  printf "    ${BOLD}1)${RESET} developer\n"
+  printf "    ${BOLD}2)${RESET} designer\n"
+  printf "    ${BOLD}3)${RESET} manager\n"
+  printf "    ${BOLD}4)${RESET} executive\n\n"
+
+  local choice
+  while true; do
+    printf "  ${YELLOW}?${RESET} Enter choice [1-4]: "
+    read -r choice
+    case "$choice" in
+      1) config_set role "developer";  success "Role set to: developer";  break ;;
+      2) config_set role "designer";   success "Role set to: designer";   break ;;
+      3) config_set role "manager";    success "Role set to: manager";    break ;;
+      4) config_set role "executive";  success "Role set to: executive";  break ;;
+      *) warn "Invalid choice. Please enter 1, 2, 3, or 4." ;;
+    esac
+  done
+}
+
+# ── Step 2: Check Prerequisites ───────────────────────────────────────────────
+
+check_tool() {
+  local cmd="$1" name="$2" install_cmd="$3"
+
+  if command -v "$cmd" &>/dev/null; then
+    success "${name} is installed ($(command -v "$cmd"))"
+    return 0
+  fi
+
+  warn "${name} is not installed"
+  info "Install command: ${BOLD}${install_cmd}${RESET}"
+
+  if confirm "Install ${name}?"; then
+    step "Installing ${name}..."
+    if eval "$install_cmd"; then
+      success "${name} installed successfully"
+    else
+      error "Failed to install ${name}"
+      error "Please install manually and re-run './bart init'"
+      exit 1
+    fi
+  else
+    error "${name} is required. Please install it manually and re-run './bart init'"
+    exit 1
+  fi
+}
+
+step_check_prerequisites() {
+  header "Checking Prerequisites"
+
+  check_tool "git"    "Git"        "brew install git"
+  check_tool "pnpm"   "pnpm"       "brew install pnpm"
+  check_tool "gh"     "GitHub CLI"  "brew install gh"
+  check_tool "claude" "Claude Code" "pnpm add -g @anthropic-ai/claude-code"
+}
+
+# ── Step 3: Check GitHub Auth ─────────────────────────────────────────────────
+
+step_check_gh_auth() {
+  header "GitHub Authentication"
+
+  local status_output
+  status_output=$(gh auth status 2>&1) || true
+
+  # Extract account names from gh auth status output
+  local accounts=()
+  local active_account=""
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ Logged\ in\ to ]]; then
+      local acct
+      acct=$(echo "$line" | sed -E 's/.*(account|as) ([^ (]+).*/\2/')
+      if [[ -n "$acct" && "$acct" != "$line" ]]; then
+        accounts+=("$acct")
+      fi
+    fi
+  done <<< "$status_output"
+
+  # Detect which account is currently active
+  active_account=$(echo "$status_output" | grep -B2 'Active account: true' | sed -E -n 's/.*(account|as) ([^ (]+).*/\2/p' | head -1)
+
+  if [[ ${#accounts[@]} -eq 0 ]]; then
+    warn "No GitHub accounts found"
+    if confirm "Run 'gh auth login' to authenticate?"; then
+      gh auth login
+      if gh auth status &>/dev/null; then
+        success "GitHub authentication complete"
+      else
+        error "GitHub authentication failed. Please run 'gh auth login' manually."
+        exit 1
+      fi
+    else
+      error "GitHub authentication is required for cloning repos."
+      exit 1
+    fi
+    return
+  fi
+
+  printf "  Authenticated GitHub accounts:\n\n"
+  local i=1
+  for acct in "${accounts[@]}"; do
+    local active_marker=""
+    if [[ "$acct" == "$active_account" ]]; then
+      active_marker=" ${GREEN}(active)${RESET}"
+    fi
+    printf "    ${BOLD}${i})${RESET} %s%b\n" "$acct" "$active_marker"
+    i=$((i + 1))
+  done
+  printf "    ${BOLD}${i})${RESET} Log in to a different account\n\n"
+
+  local choice
+  while true; do
+    printf "  ${YELLOW}?${RESET} Select account to use [1-${i}]: "
+    read -r choice
+    if [[ "$choice" -ge 1 && "$choice" -le ${#accounts[@]} ]] 2>/dev/null; then
+      local selected="${accounts[$((choice - 1))]}"
+      if [[ "$selected" != "$active_account" ]]; then
+        step "Switching to ${selected}..."
+        gh auth switch -u "$selected" 2>/dev/null || true
+      fi
+      success "Using GitHub account: ${selected}"
+      break
+    elif [[ "$choice" -eq $i ]] 2>/dev/null; then
+      gh auth login
+      if gh auth status &>/dev/null; then
+        success "GitHub authentication complete"
+      else
+        error "GitHub authentication failed. Please run 'gh auth login' manually."
+        exit 1
+      fi
+      break
+    else
+      warn "Invalid choice."
+    fi
+  done
+}
+
+# ── Step 4: Check Claude Code Auth ────────────────────────────────────────────
+
+step_check_claude_auth() {
+  header "Claude Code Authentication"
+
+  local output
+  output=$(claude -p "ping" --max-turns 1 2>&1) || true
+
+  if echo "$output" | grep -qi "auth\|login\|sign in\|API key\|not authenticated\|unauthorized"; then
+    warn "Claude Code does not appear to be authenticated"
+    info "Please run 'claude' interactively to complete authentication."
+    if confirm "Open Claude Code interactively now?"; then
+      claude
+    else
+      warn "Skipping — you can authenticate later by running 'claude'"
+    fi
+  else
+    success "Claude Code is authenticated"
+  fi
+}
+
+# ── Repo Operations ───────────────────────────────────────────────────────────
+
+link_skills_for_repo() {
+  local short_name="$1"
+  local repo_skills_dir="${WORKSPACE_DIR}/${short_name}/.claude/skills"
+
+  mkdir -p "$CLAUDE_SKILLS_DIR"
+
+  if [[ ! -d "$repo_skills_dir" ]]; then
+    return
+  fi
+
+  local linked=0
+  for skill_file in "$repo_skills_dir"/*; do
+    [[ -e "$skill_file" ]] || continue
+
+    local filename
+    filename=$(basename "$skill_file")
+    local link_path="${CLAUDE_SKILLS_DIR}/${short_name}--${filename}"
+
+    ln -sf "$skill_file" "$link_path"
+    linked=$((linked + 1))
+  done
+
+  if [[ $linked -gt 0 ]]; then
+    success "Linked ${linked} skill(s) from ${short_name}"
+  fi
+}
+
+unlink_skills_for_repo() {
+  local short_name="$1"
+
+  if [[ ! -d "$CLAUDE_SKILLS_DIR" ]]; then
+    return
+  fi
+
+  local removed=0
+  for link in "$CLAUDE_SKILLS_DIR"/${short_name}--*; do
+    [[ -L "$link" ]] || continue
+    rm "$link"
+    removed=$((removed + 1))
+  done
+
+  if [[ $removed -gt 0 ]]; then
+    success "Removed ${removed} skill symlink(s) for ${short_name}"
+  fi
+}
+
+clone_repo() {
+  local short_name="$1"
+  local full_repo
+  full_repo=$(get_full_repo "$short_name")
+  local target_dir="${WORKSPACE_DIR}/${short_name}"
+
+  if [[ -d "$target_dir" ]]; then
+    success "${short_name} already exists"
+  else
+    step "Cloning ${full_repo}..."
+    if gh repo clone "$full_repo" "$target_dir"; then
+      success "${short_name} cloned"
+    else
+      error "Failed to clone ${full_repo}"
+      exit 1
+    fi
+  fi
+
+  link_skills_for_repo "$short_name"
+}
+
+unclone_repo() {
+  local short_name="$1"
+  local target_dir="${WORKSPACE_DIR}/${short_name}"
+
+  unlink_skills_for_repo "$short_name"
+
+  if [[ -d "$target_dir" ]]; then
+    rm -rf "$target_dir"
+    success "Removed ${short_name}"
+  else
+    info "${short_name} is not cloned"
+  fi
+}
+
+# ── Init Steps ────────────────────────────────────────────────────────────────
+
+step_clone_repos() {
+  local role
+  role=$(config_get role)
+
+  header "Cloning Repositories (role: ${role})"
+
+  local repos
+  repos=$(get_repos_for_role "$role")
+
+  for short_name in $repos; do
+    clone_repo "$short_name"
+  done
+}
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+
+cmd_init() {
+  printf "\n  ${BOLD}${CYAN}bart init${RESET}\n"
+  printf "  ${DIM}Bartlett workspace setup${RESET}\n"
+
+  step_ask_role
+  step_check_prerequisites
+  step_check_gh_auth
+  step_check_claude_auth
+  step_clone_repos
+
+  config_set init_completed true
+
+  header "Setup Complete"
+
+  local role
+  role=$(config_get role)
+  success "Role: ${role}"
+  success "Workspace: ${WORKSPACE_DIR}"
+  info "Run 'claude' from this directory to get started."
+  printf "\n"
+}
+
+cmd_reset() {
+  printf "\n  ${BOLD}${RED}bart reset${RESET}\n"
+  printf "  ${DIM}Remove all cloned repos, skills symlinks, and config${RESET}\n"
+
+  header "Reset Workspace"
+
+  warn "This will:"
+  printf "    - Delete all cloned repositories\n"
+  printf "    - Remove all skill symlinks\n"
+  printf "    - Delete the .bart config file\n\n"
+
+  if ! confirm "Are you sure you want to reset the workspace?"; then
+    info "Reset cancelled."
+    return
+  fi
+
+  # Remove skill symlinks
+  if [[ -d "$CLAUDE_SKILLS_DIR" ]]; then
+    local removed=0
+    for link in "$CLAUDE_SKILLS_DIR"/*; do
+      [[ -L "$link" ]] || continue
+      rm "$link"
+      removed=$((removed + 1))
+    done
+    if [[ $removed -gt 0 ]]; then
+      success "Removed ${removed} skill symlink(s)"
+    fi
+  fi
+
+  # Remove cloned repos
+  for short_name in $ALL_REPOS; do
+    local target_dir="${WORKSPACE_DIR}/${short_name}"
+    if [[ -d "$target_dir" ]]; then
+      rm -rf "$target_dir"
+      success "Removed ${short_name}"
+    fi
+  done
+
+  # Remove config file
+  if [[ -f "$CONFIG_FILE" ]]; then
+    rm "$CONFIG_FILE"
+    success "Removed .bart config"
+  fi
+
+  header "Reset Complete"
+  info "Run './bart init' to set up again."
+  printf "\n"
+}
+
+cmd_list() {
+  printf "\n  ${BOLD}${CYAN}bart list${RESET}\n"
+  printf "  ${DIM}Available repositories${RESET}\n\n"
+
+  local role
+  role=$(config_get role)
+  local role_repos=""
+  if [[ -n "$role" ]]; then
+    role_repos=$(get_repos_for_role "$role")
+  fi
+
+  for short_name in $ALL_REPOS; do
+    local full_repo
+    full_repo=$(get_full_repo "$short_name")
+    local target_dir="${WORKSPACE_DIR}/${short_name}"
+
+    # Status: cloned or not
+    local status
+    if [[ -d "$target_dir" ]]; then
+      status="${GREEN}cloned${RESET}"
+    else
+      status="${DIM}not cloned${RESET}"
+    fi
+
+    # Role match indicator
+    local role_tag=""
+    if [[ -n "$role" ]]; then
+      if echo "$role_repos" | grep -qw "$short_name"; then
+        role_tag=" ${CYAN}(${role})${RESET}"
+      fi
+    fi
+
+    printf "  %-35s %b%b\n" "${full_repo}" "$status" "$role_tag"
+  done
+  printf "\n"
+}
+
+cmd_clone() {
+  local target="${1:-}"
+
+  if [[ -z "$target" ]]; then
+    # No argument — show interactive picker
+    printf "\n  ${BOLD}${CYAN}bart clone${RESET}\n"
+    printf "  ${DIM}Select a repository to clone${RESET}\n\n"
+
+    # Build list of not-yet-cloned repos
+    local options=()
+    local i=1
+    for short_name in $ALL_REPOS; do
+      local target_dir="${WORKSPACE_DIR}/${short_name}"
+      if [[ -d "$target_dir" ]]; then
+        printf "    ${DIM}${i})${RESET} ${short_name} ${GREEN}(already cloned)${RESET}\n"
+      else
+        printf "    ${BOLD}${i})${RESET} ${short_name}\n"
+      fi
+      options+=("$short_name")
+      i=$((i + 1))
+    done
+    printf "    ${BOLD}${i})${RESET} All repos\n\n"
+
+    local choice
+    while true; do
+      printf "  ${YELLOW}?${RESET} Enter choice [1-${i}]: "
+      read -r choice
+      if [[ "$choice" -ge 1 && "$choice" -le ${#options[@]} ]] 2>/dev/null; then
+        clone_repo "${options[$((choice - 1))]}"
+        break
+      elif [[ "$choice" -eq $i ]] 2>/dev/null; then
+        for short_name in $ALL_REPOS; do
+          clone_repo "$short_name"
+        done
+        break
+      else
+        warn "Invalid choice."
+      fi
+    done
+  elif [[ "$target" == "--all" ]]; then
+    printf "\n  ${BOLD}${CYAN}bart clone --all${RESET}\n"
+    printf "  ${DIM}Cloning all repositories${RESET}\n"
+
+    for short_name in $ALL_REPOS; do
+      clone_repo "$short_name"
+    done
+  else
+    # Clone a specific repo by short name or full name
+    local short_name="$target"
+    # Handle full name input (e.g. SalesTrak/salestrak-monorepo)
+    short_name="${short_name##*/}"
+
+    local full_repo
+    full_repo=$(get_full_repo "$short_name")
+    if [[ -z "$full_repo" ]]; then
+      error "Unknown repo: ${target}"
+      info "Available repos:"
+      for name in $ALL_REPOS; do
+        info "  ${name}"
+      done
+      exit 1
+    fi
+
+    printf "\n  ${BOLD}${CYAN}bart clone${RESET} ${short_name}\n"
+    clone_repo "$short_name"
+  fi
+  printf "\n"
+}
+
+cmd_rm() {
+  local target="${1:-}"
+
+  if [[ -z "$target" ]]; then
+    # No argument — show interactive picker of cloned repos
+    printf "\n  ${BOLD}${RED}bart rm${RESET}\n"
+    printf "  ${DIM}Select a repository to remove${RESET}\n\n"
+
+    local options=()
+    local i=1
+    for short_name in $ALL_REPOS; do
+      local target_dir="${WORKSPACE_DIR}/${short_name}"
+      if [[ -d "$target_dir" ]]; then
+        printf "    ${BOLD}${i})${RESET} ${short_name}\n"
+        options+=("$short_name")
+        i=$((i + 1))
+      fi
+    done
+
+    if [[ ${#options[@]} -eq 0 ]]; then
+      info "No repos are cloned."
+      printf "\n"
+      return
+    fi
+
+    printf "    ${BOLD}${i})${RESET} All cloned repos\n\n"
+
+    local choice
+    while true; do
+      printf "  ${YELLOW}?${RESET} Enter choice [1-${i}]: "
+      read -r choice
+      if [[ "$choice" -ge 1 && "$choice" -le ${#options[@]} ]] 2>/dev/null; then
+        if confirm "Remove ${options[$((choice - 1))]}?"; then
+          unclone_repo "${options[$((choice - 1))]}"
+        fi
+        break
+      elif [[ "$choice" -eq $i ]] 2>/dev/null; then
+        if confirm "Remove all cloned repos?"; then
+          for name in "${options[@]}"; do
+            unclone_repo "$name"
+          done
+        fi
+        break
+      else
+        warn "Invalid choice."
+      fi
+    done
+  elif [[ "$target" == "--all" ]]; then
+    printf "\n  ${BOLD}${RED}bart rm --all${RESET}\n"
+    if confirm "Remove all cloned repos?"; then
+      for short_name in $ALL_REPOS; do
+        unclone_repo "$short_name"
+      done
+    fi
+  else
+    local short_name="$target"
+    short_name="${short_name##*/}"
+
+    local full_repo
+    full_repo=$(get_full_repo "$short_name")
+    if [[ -z "$full_repo" ]]; then
+      error "Unknown repo: ${target}"
+      info "Available repos:"
+      for name in $ALL_REPOS; do
+        info "  ${name}"
+      done
+      exit 1
+    fi
+
+    printf "\n  ${BOLD}${RED}bart rm${RESET} ${short_name}\n"
+    if confirm "Remove ${short_name} and its skill symlinks?"; then
+      unclone_repo "$short_name"
+    fi
+  fi
+  printf "\n"
+}
+
+cmd_help() {
+  printf "\n  ${BOLD}bart${RESET} — Bartlett Workspace Manager\n\n"
+  printf "  ${BOLD}Usage:${RESET}\n"
+  printf "    ./bart <command>\n\n"
+  printf "  ${BOLD}Commands:${RESET}\n"
+  printf "    init    Set up the workspace (role, tools, repos, skills)\n"
+  printf "    list    Show all repos and their status\n"
+  printf "    clone   Clone a repo and link its skills\n"
+  printf "    rm      Remove a repo and unlink its skills\n"
+  printf "    reset   Remove all repos, symlinks, and config\n"
+  printf "    help    Show this help message\n\n"
+  printf "  ${BOLD}Examples:${RESET}\n"
+  printf "    ./bart clone                    Interactive repo picker\n"
+  printf "    ./bart clone salestrak-monorepo Clone a specific repo\n"
+  printf "    ./bart clone --all              Clone all repos\n"
+  printf "    ./bart rm                       Interactive repo picker\n"
+  printf "    ./bart rm salestrak-monorepo    Remove a specific repo\n"
+  printf "    ./bart rm --all                 Remove all repos\n\n"
+}
+
+# ── Main Entry Point ──────────────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    init)           cmd_init "$@" ;;
+    list|ls)        cmd_list "$@" ;;
+    clone)          cmd_clone "$@" ;;
+    rm)             cmd_rm "$@" ;;
+    reset)          cmd_reset "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *)
+      error "Unknown command: ${cmd}"
+      cmd_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
