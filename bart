@@ -77,7 +77,7 @@ step()    { printf "  ${DIM}→${RESET} %s\n" "$1"; }
 # ── Utility Functions ──────────────────────────────────────────────────────────
 
 check_update_notification() {
-  # Skip if running update command or if bart isn't installed
+  # Skip if bart isn't installed
   [[ ! -f "${BART_HOME}/bart" ]] && return
 
   # Determine GitHub repo
@@ -106,10 +106,15 @@ check_update_notification() {
   local commit_data
   commit_data=$(gh api "repos/${github_repo}/commits?path=bart&per_page=1" 2>/dev/null) || return
 
+  # Extract date using jq if available, otherwise use grep
   local github_date
-  github_date=$(echo "$commit_data" | grep -o '"date": "[^"]*"' | head -1 | cut -d'"' -f4 || true)
+  if command -v jq &>/dev/null; then
+    github_date=$(echo "$commit_data" | jq -r '.[0].commit.committer.date' 2>/dev/null || true)
+  else
+    github_date=$(echo "$commit_data" | grep -o '"date"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/' || true)
+  fi
 
-  [[ -z "$github_date" ]] && return
+  [[ -z "$github_date" || "$github_date" == "null" ]] && return
 
   # Convert GitHub ISO 8601 timestamp to Unix timestamp
   local github_timestamp
@@ -121,7 +126,7 @@ check_update_notification() {
 
   [[ -z "$github_timestamp" ]] && return
 
-  # Compare timestamps and show notification if update available
+  # Show notification if update available
   if [[ $github_timestamp -gt $bart_timestamp ]]; then
     printf "\n  ${YELLOW}⚠${RESET}  Run ${BOLD}bart update${RESET} to get latest changes\n"
   fi
@@ -930,12 +935,15 @@ cmd_update() {
     local commit_data
     commit_data=$(gh api "repos/${github_repo}/commits?path=${file_path}&per_page=1" 2>/dev/null) || return
 
+    # Extract date using jq if available, otherwise use grep
     local github_date
-    github_date=$(echo "$commit_data" | grep -o '"date": "[^"]*"' | head -1 | cut -d'"' -f4 || true)
-
-    if [[ -z "$github_date" ]]; then
-      return
+    if command -v jq &>/dev/null; then
+      github_date=$(echo "$commit_data" | jq -r '.[0].commit.committer.date' 2>/dev/null || true)
+    else
+      github_date=$(echo "$commit_data" | grep -o '"date"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/' || true)
     fi
+
+    [[ -z "$github_date" || "$github_date" == "null" ]] && return
 
     # Convert GitHub ISO 8601 timestamp to Unix timestamp
     local github_timestamp
@@ -973,10 +981,15 @@ cmd_update() {
       local commit_data
       commit_data=$(gh api "repos/${github_repo}/commits?path=bart&per_page=1" 2>/dev/null)
       if [[ -n "$commit_data" ]]; then
+        # Extract date using jq if available, otherwise use grep
         local github_date
-        github_date=$(echo "$commit_data" | grep -o '"date": "[^"]*"' | head -1 | cut -d'"' -f4 || true)
+        if command -v jq &>/dev/null; then
+          github_date=$(echo "$commit_data" | jq -r '.[0].commit.committer.date' 2>/dev/null || true)
+        else
+          github_date=$(echo "$commit_data" | grep -o '"date"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/' || true)
+        fi
 
-        if [[ -n "$github_date" ]]; then
+        if [[ -n "$github_date" && "$github_date" != "null" ]]; then
           local github_timestamp
           if [[ "$OSTYPE" == "darwin"* ]]; then
             github_timestamp=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${github_date}" +%s 2>/dev/null)
