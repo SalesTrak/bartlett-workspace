@@ -674,41 +674,23 @@ cmd_clone() {
   local target="${1:-}"
 
   if [[ -z "$target" ]]; then
-    require_tty clone
-    # No argument — show interactive picker
+    # Non-interactive mode: clone all repos for role by default
+    local role
+    role=$(config_get role)
+
+    if [[ -z "$role" ]]; then
+      error "No role configured. Please run 'bart init' first or specify a repo name."
+      exit 1
+    fi
+
     printf "\n  ${BOLD}${CYAN}bart clone${RESET}\n"
-    printf "  ${DIM}Select a repository to clone${RESET}\n\n"
+    printf "  ${DIM}Cloning all repositories for role: ${role}${RESET}\n"
 
-    # Build list of not-yet-cloned repos
-    local options=()
-    local i=1
-    for short_name in $ALL_REPOS; do
-      local target_dir="${WORKSPACE_DIR}/${short_name}"
-      if [[ -d "$target_dir" ]]; then
-        printf "    ${DIM}${i})${RESET} ${short_name} ${GREEN}(already cloned)${RESET}\n"
-      else
-        printf "    ${BOLD}${i})${RESET} ${short_name}\n"
-      fi
-      options+=("$short_name")
-      i=$((i + 1))
-    done
-    printf "    ${BOLD}${i})${RESET} All repos\n\n"
+    local repos
+    repos=$(get_repos_for_role "$role")
 
-    local choice
-    while true; do
-      printf "  ${YELLOW}?${RESET} Enter choice [1-${i}]: "
-      read -r choice
-      if [[ "$choice" -ge 1 && "$choice" -le ${#options[@]} ]] 2>/dev/null; then
-        clone_repo "${options[$((choice - 1))]}"
-        break
-      elif [[ "$choice" -eq $i ]] 2>/dev/null; then
-        for short_name in $ALL_REPOS; do
-          clone_repo "$short_name"
-        done
-        break
-      else
-        warn "Invalid choice."
-      fi
+    for short_name in $repos; do
+      clone_repo "$short_name"
     done
   elif [[ "$target" == "--all" ]]; then
     printf "\n  ${BOLD}${CYAN}bart clone --all${RESET}\n"
@@ -741,60 +723,24 @@ cmd_clone() {
 }
 
 cmd_rm() {
-  require_tty rm
   local target="${1:-}"
 
   if [[ -z "$target" ]]; then
-    # No argument — show interactive picker of cloned repos
-    printf "\n  ${BOLD}${RED}bart rm${RESET}\n"
-    printf "  ${DIM}Select a repository to remove${RESET}\n\n"
-
-    local options=()
-    local i=1
-    for short_name in $ALL_REPOS; do
-      local target_dir="${WORKSPACE_DIR}/${short_name}"
-      if [[ -d "$target_dir" ]]; then
-        printf "    ${BOLD}${i})${RESET} ${short_name}\n"
-        options+=("$short_name")
-        i=$((i + 1))
-      fi
+    # Non-interactive mode: require explicit repo name or --all flag
+    error "Please specify a repository name or use --all"
+    info "Usage: bart rm <repo-name> | --all"
+    info "Available repos:"
+    for name in $ALL_REPOS; do
+      info "  ${name}"
     done
-
-    if [[ ${#options[@]} -eq 0 ]]; then
-      info "No repos are cloned."
-      printf "\n"
-      return
-    fi
-
-    printf "    ${BOLD}${i})${RESET} All cloned repos\n\n"
-
-    local choice
-    while true; do
-      printf "  ${YELLOW}?${RESET} Enter choice [1-${i}]: "
-      read -r choice
-      if [[ "$choice" -ge 1 && "$choice" -le ${#options[@]} ]] 2>/dev/null; then
-        if confirm "Remove ${options[$((choice - 1))]}?"; then
-          unclone_repo "${options[$((choice - 1))]}"
-        fi
-        break
-      elif [[ "$choice" -eq $i ]] 2>/dev/null; then
-        if confirm "Remove all cloned repos?"; then
-          for name in "${options[@]}"; do
-            unclone_repo "$name"
-          done
-        fi
-        break
-      else
-        warn "Invalid choice."
-      fi
-    done
+    exit 1
   elif [[ "$target" == "--all" ]]; then
     printf "\n  ${BOLD}${RED}bart rm --all${RESET}\n"
-    if confirm "Remove all cloned repos?"; then
-      for short_name in $ALL_REPOS; do
-        unclone_repo "$short_name"
-      done
-    fi
+    printf "  ${DIM}Removing all cloned repositories${RESET}\n"
+
+    for short_name in $ALL_REPOS; do
+      unclone_repo "$short_name"
+    done
   else
     local short_name="$target"
     short_name="${short_name##*/}"
@@ -811,9 +757,8 @@ cmd_rm() {
     fi
 
     printf "\n  ${BOLD}${RED}bart rm${RESET} ${short_name}\n"
-    if confirm "Remove ${short_name} and its skill symlinks?"; then
-      unclone_repo "$short_name"
-    fi
+    info "Removing ${short_name} and its skill symlinks"
+    unclone_repo "$short_name"
   fi
   printf "\n"
 }
@@ -1009,13 +954,8 @@ cmd_update() {
   done
   printf "\n"
 
-  if [[ $force_update == false ]]; then
-    if ! confirm "Download and install updates?"; then
-      info "Update cancelled."
-      printf "\n"
-      return
-    fi
-  fi
+  # Non-interactive mode: automatically proceed with updates
+  info "Proceeding with updates"
 
   # Download and install updates
   header "Installing Updates"
