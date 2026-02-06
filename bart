@@ -77,8 +77,14 @@ step()    { printf "  ${DIM}→${RESET} %s\n" "$1"; }
 # ── Utility Functions ──────────────────────────────────────────────────────────
 
 check_update_notification() {
+  printf "\n  ${DIM}[DEBUG] Update notification check${RESET}\n"
+
   # Skip if bart isn't installed
-  [[ ! -f "${BART_HOME}/bart" ]] && return
+  if [[ ! -f "${BART_HOME}/bart" ]]; then
+    printf "  ${DIM}[DEBUG] bart not installed at ${BART_HOME}/bart${RESET}\n"
+    return
+  fi
+  printf "  ${DIM}[DEBUG] bart found at ${BART_HOME}/bart${RESET}\n"
 
   # Determine GitHub repo
   local github_repo="SalesTrak/bartlett-workspace"
@@ -91,6 +97,7 @@ check_update_notification() {
       fi
     fi
   fi
+  printf "  ${DIM}[DEBUG] GitHub repo: %s${RESET}\n" "$github_repo"
 
   # Check bart script timestamp
   local bart_timestamp
@@ -100,21 +107,37 @@ check_update_notification() {
     bart_timestamp=$(stat -c %Y "${BART_HOME}/bart" 2>/dev/null)
   fi
 
-  [[ -z "$bart_timestamp" ]] && return
+  if [[ -z "$bart_timestamp" ]]; then
+    printf "  ${DIM}[DEBUG] Could not get local timestamp${RESET}\n"
+    return
+  fi
+  printf "  ${DIM}[DEBUG] Local bart timestamp: %s${RESET}\n" "$bart_timestamp"
 
   # Get GitHub commit timestamp for bart
+  printf "  ${DIM}[DEBUG] Fetching GitHub data...${RESET}\n"
   local commit_data
-  commit_data=$(gh api "repos/${github_repo}/commits?path=bart&per_page=1" 2>/dev/null) || return
+  commit_data=$(gh api "repos/${github_repo}/commits?path=bart&per_page=1" 2>/dev/null)
+  if [[ $? -ne 0 || -z "$commit_data" ]]; then
+    printf "  ${DIM}[DEBUG] Failed to fetch GitHub data${RESET}\n"
+    return
+  fi
+  printf "  ${DIM}[DEBUG] API response (first 200 chars): %s${RESET}\n" "${commit_data:0:200}"
 
   # Extract date using jq if available, otherwise use grep
   local github_date
   if command -v jq &>/dev/null; then
+    printf "  ${DIM}[DEBUG] Using jq to extract date${RESET}\n"
     github_date=$(echo "$commit_data" | jq -r '.[0].commit.committer.date' 2>/dev/null || true)
   else
+    printf "  ${DIM}[DEBUG] Using grep to extract date${RESET}\n"
     github_date=$(echo "$commit_data" | grep -o '"date"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/' || true)
   fi
 
-  [[ -z "$github_date" || "$github_date" == "null" ]] && return
+  if [[ -z "$github_date" || "$github_date" == "null" ]]; then
+    printf "  ${DIM}[DEBUG] Could not extract GitHub date (got: '%s')${RESET}\n" "$github_date"
+    return
+  fi
+  printf "  ${DIM}[DEBUG] GitHub date: %s${RESET}\n" "$github_date"
 
   # Convert GitHub ISO 8601 timestamp to Unix timestamp
   local github_timestamp
@@ -124,11 +147,18 @@ check_update_notification() {
     github_timestamp=$(date -d "${github_date}" +%s 2>/dev/null)
   fi
 
-  [[ -z "$github_timestamp" ]] && return
+  if [[ -z "$github_timestamp" ]]; then
+    printf "  ${DIM}[DEBUG] Could not convert GitHub timestamp${RESET}\n"
+    return
+  fi
+  printf "  ${DIM}[DEBUG] GitHub timestamp: %s${RESET}\n" "$github_timestamp"
 
   # Show notification if update available
   if [[ $github_timestamp -gt $bart_timestamp ]]; then
+    printf "  ${DIM}[DEBUG] Update available (%s > %s)${RESET}\n" "$github_timestamp" "$bart_timestamp"
     printf "\n  ${YELLOW}⚠${RESET}  Run ${BOLD}bart update${RESET} to get latest changes\n"
+  else
+    printf "  ${DIM}[DEBUG] Up to date (%s <= %s)${RESET}\n" "$github_timestamp" "$bart_timestamp"
   fi
 }
 
@@ -932,18 +962,30 @@ cmd_update() {
     fi
 
     # Get GitHub commit timestamp for this file
+    step "[DEBUG] Checking ${file_path}..."
     local commit_data
-    commit_data=$(gh api "repos/${github_repo}/commits?path=${file_path}&per_page=1" 2>/dev/null) || return
+    commit_data=$(gh api "repos/${github_repo}/commits?path=${file_path}&per_page=1" 2>/dev/null)
+    if [[ $? -ne 0 || -z "$commit_data" ]]; then
+      info "[DEBUG] Failed to fetch GitHub data for ${file_path}"
+      return
+    fi
+    info "[DEBUG] API response (first 200 chars): ${commit_data:0:200}"
 
     # Extract date using jq if available, otherwise use grep
     local github_date
     if command -v jq &>/dev/null; then
+      info "[DEBUG] Using jq to extract date"
       github_date=$(echo "$commit_data" | jq -r '.[0].commit.committer.date' 2>/dev/null || true)
     else
+      info "[DEBUG] Using grep to extract date"
       github_date=$(echo "$commit_data" | grep -o '"date"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/' || true)
     fi
 
-    [[ -z "$github_date" || "$github_date" == "null" ]] && return
+    if [[ -z "$github_date" || "$github_date" == "null" ]]; then
+      info "[DEBUG] Could not extract GitHub date (got: '${github_date}')"
+      return
+    fi
+    info "[DEBUG] GitHub date: ${github_date}"
 
     # Convert GitHub ISO 8601 timestamp to Unix timestamp
     local github_timestamp
@@ -958,9 +1000,13 @@ cmd_update() {
     fi
 
     # Compare timestamps
+    info "[DEBUG] Local: ${local_timestamp}, GitHub: ${github_timestamp}"
     if [[ $github_timestamp -gt $local_timestamp ]]; then
+      info "[DEBUG] Update needed for ${file_path}"
       files_to_update+=("$file_path")
       updates_available=true
+    else
+      info "[DEBUG] ${file_path} is up to date"
     fi
   }
 
@@ -978,18 +1024,23 @@ cmd_update() {
         bart_timestamp=$(stat -c %Y "${BART_HOME}/bart")
       fi
 
+      step "[DEBUG] Checking bart script..."
       local commit_data
       commit_data=$(gh api "repos/${github_repo}/commits?path=bart&per_page=1" 2>/dev/null)
       if [[ -n "$commit_data" ]]; then
+        info "[DEBUG] API response (first 200 chars): ${commit_data:0:200}"
         # Extract date using jq if available, otherwise use grep
         local github_date
         if command -v jq &>/dev/null; then
+          info "[DEBUG] Using jq to extract date"
           github_date=$(echo "$commit_data" | jq -r '.[0].commit.committer.date' 2>/dev/null || true)
         else
+          info "[DEBUG] Using grep to extract date"
           github_date=$(echo "$commit_data" | grep -o '"date"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/' || true)
         fi
 
         if [[ -n "$github_date" && "$github_date" != "null" ]]; then
+          info "[DEBUG] GitHub date: ${github_date}"
           local github_timestamp
           if [[ "$OSTYPE" == "darwin"* ]]; then
             github_timestamp=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${github_date}" +%s 2>/dev/null)
@@ -997,9 +1048,14 @@ cmd_update() {
             github_timestamp=$(date -d "${github_date}" +%s 2>/dev/null)
           fi
 
+          info "[DEBUG] GitHub timestamp: ${github_timestamp}"
+          info "[DEBUG] Local bart timestamp: ${bart_timestamp}"
           if [[ -n "$github_timestamp" && $github_timestamp -gt $bart_timestamp ]]; then
+            info "[DEBUG] Update needed for bart"
             files_to_update+=("bart")
             updates_available=true
+          else
+            info "[DEBUG] bart is up to date"
           fi
         fi
       fi
