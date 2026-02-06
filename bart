@@ -139,10 +139,11 @@ check_update_notification() {
   fi
   printf "  ${DIM}[DEBUG] GitHub date: %s${RESET}\n" "$github_date"
 
-  # Convert GitHub ISO 8601 timestamp to Unix timestamp
+  # Convert GitHub ISO 8601 timestamp to Unix timestamp (in UTC)
   local github_timestamp
   if [[ "$OSTYPE" == "darwin"* ]]; then
-    github_timestamp=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${github_date}" +%s 2>/dev/null)
+    # macOS: use -u flag to keep time in UTC
+    github_timestamp=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "${github_date}" +%s 2>/dev/null)
   else
     github_timestamp=$(date -d "${github_date}" +%s 2>/dev/null)
   fi
@@ -987,10 +988,11 @@ cmd_update() {
     fi
     info "[DEBUG] GitHub date: ${github_date}"
 
-    # Convert GitHub ISO 8601 timestamp to Unix timestamp
+    # Convert GitHub ISO 8601 timestamp to Unix timestamp (in UTC)
     local github_timestamp
     if [[ "$OSTYPE" == "darwin"* ]]; then
-      github_timestamp=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${github_date}" +%s 2>/dev/null)
+      # macOS: use -u flag to keep time in UTC
+      github_timestamp=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "${github_date}" +%s 2>/dev/null)
     else
       github_timestamp=$(date -d "${github_date}" +%s 2>/dev/null)
     fi
@@ -1041,9 +1043,11 @@ cmd_update() {
 
         if [[ -n "$github_date" && "$github_date" != "null" ]]; then
           info "[DEBUG] GitHub date: ${github_date}"
+          # Convert GitHub ISO 8601 timestamp to Unix timestamp (in UTC)
           local github_timestamp
           if [[ "$OSTYPE" == "darwin"* ]]; then
-            github_timestamp=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${github_date}" +%s 2>/dev/null)
+            # macOS: use TZ=UTC to keep time in UTC
+            github_timestamp=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "${github_date}" +%s 2>/dev/null)
           else
             github_timestamp=$(date -d "${github_date}" +%s 2>/dev/null)
           fi
