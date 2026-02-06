@@ -7,26 +7,29 @@ set -euo pipefail
 REPO="SalesTrak/bartlett-workspace"
 BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
-INSTALL_DIR="${HOME}/develop/bartlett-workspace"
+BART_HOME="${HOME}/.bart"
 
 # Colors (if terminal supports them)
 if [ -t 1 ]; then
   BOLD='\033[1m'
   CYAN='\033[0;36m'
   GREEN='\033[0;32m'
+  YELLOW='\033[1;33m'
   RED='\033[0;31m'
   DIM='\033[2m'
   RESET='\033[0m'
 else
-  BOLD='' CYAN='' GREEN='' RED='' DIM='' RESET=''
+  BOLD='' CYAN='' GREEN='' YELLOW='' RED='' DIM='' RESET=''
 fi
 
 info()    { printf "  ${CYAN}>${RESET} %s\n" "$1"; }
 success() { printf "  ${GREEN}✓${RESET} %s\n" "$1"; }
+warn()    { printf "  ${YELLOW}!${RESET} %s\n" "$1"; }
 error()   { printf "  ${RED}✗${RESET} %s\n" "$1"; }
+header()  { printf "\n${BOLD}${CYAN}══ %s ══${RESET}\n\n" "$1"; }
 
-printf "\n  ${BOLD}${CYAN}Bartlett Workspace Installer${RESET}\n"
-printf "  ${DIM}Setting up your development environment${RESET}\n\n"
+printf "\n  ${BOLD}${CYAN}bart Installer${RESET}\n"
+printf "  ${DIM}Installing bart CLI globally${RESET}\n\n"
 
 # Check for curl
 if ! command -v curl &>/dev/null; then
@@ -34,30 +37,65 @@ if ! command -v curl &>/dev/null; then
   exit 1
 fi
 
-# Create workspace directory
-if [ -d "$INSTALL_DIR" ]; then
-  error "Directory already exists: ${INSTALL_DIR}"
-  info "Remove it first or run ./bart init from inside it."
+# ── Install bart Globally ─────────────────────────────────────────────────────
+
+header "Installing bart"
+
+# Create ~/.bart directory
+mkdir -p "$BART_HOME"
+success "Created ${BART_HOME}"
+
+# Download bart script
+info "Downloading bart CLI from ${REPO}..."
+if curl -fsSL "${BASE_URL}/bart" -o "${BART_HOME}/bart"; then
+  chmod +x "${BART_HOME}/bart"
+  success "Installed bart to ${BART_HOME}/bart"
+else
+  error "Failed to download bart CLI"
   exit 1
 fi
 
-info "Creating ${INSTALL_DIR}"
-mkdir -p "$INSTALL_DIR"
+# ── Update Shell PATH ────────────────────────────────────────────────────────
 
-# Download workspace files
-info "Downloading bart CLI..."
-curl -fsSL "${BASE_URL}/bart" -o "${INSTALL_DIR}/bart"
-chmod +x "${INSTALL_DIR}/bart"
-success "bart CLI downloaded"
+header "Updating Shell PATH"
 
-info "Downloading CLAUDE.md..."
-curl -fsSL "${BASE_URL}/CLAUDE.md" -o "${INSTALL_DIR}/CLAUDE.md"
-success "CLAUDE.md downloaded"
+# Detect shell and add to PATH
+shell_config=""
+if [[ -n "${ZSH_VERSION:-}" ]] || [[ "${SHELL:-}" == */zsh ]]; then
+  shell_config="$HOME/.zshrc"
+elif [[ -n "${BASH_VERSION:-}" ]] || [[ "${SHELL:-}" == */bash ]]; then
+  if [[ -f "$HOME/.bash_profile" ]]; then
+    shell_config="$HOME/.bash_profile"
+  else
+    shell_config="$HOME/.bashrc"
+  fi
+else
+  warn "Could not detect shell configuration file"
+  info "Manually add 'export PATH=\"\$HOME/.bart:\$PATH\"' to your shell config"
+fi
 
-success "Workspace created at ${INSTALL_DIR}"
+# Add ~/.bart to PATH if we detected a shell config
+if [[ -n "$shell_config" ]]; then
+  # Check if ~/.bart is already in PATH
+  if grep -q "\$HOME/\.bart\|~/.bart\|${BART_HOME}" "$shell_config" 2>/dev/null; then
+    warn "~/.bart may already be in PATH (found in ${shell_config})"
+    info "Skipping PATH modification."
+  else
+    echo "" >> "$shell_config"
+    echo "# Bart CLI (added by install.sh)" >> "$shell_config"
+    echo "export PATH=\"\$HOME/.bart:\$PATH\"" >> "$shell_config"
+    success "Added ~/.bart to PATH in ${shell_config}"
+  fi
+fi
+
+# ── Complete ──────────────────────────────────────────────────────────────────
+
+header "Installation Complete"
+
+success "bart is now available globally"
+
 printf "\n"
-
-# Run init
-info "Starting workspace setup...\n"
-cd "$INSTALL_DIR"
-exec ./bart init
+info "Next steps:"
+printf "  1. Reload your shell: ${BOLD}source ${shell_config}${RESET}\n" || true
+printf "  2. Initialize your workspace: ${BOLD}bart init${RESET}\n"
+printf "\n"

@@ -5,3 +5,6 @@ design-prototypes/
 
 # Workspace config
 .bart
+
+# Bart script (installed to ~/.bart, not needed in workspace)
+bart

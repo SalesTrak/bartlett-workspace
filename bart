@@ -3,7 +3,31 @@ set -euo pipefail
 
 # ── Constants & Configuration ──────────────────────────────────────────────────
 
-WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BART_HOME="${HOME}/.bart"
+BART_CONFIG="${BART_HOME}/config"
+
+# Determine workspace directory
+BART_ROOT=""
+if [[ -f "$BART_CONFIG" ]]; then
+  # Read BART_ROOT from config file
+  BART_ROOT=$(grep "^BART_ROOT=" "$BART_CONFIG" 2>/dev/null | cut -d'=' -f2- || echo "")
+fi
+
+# Fall back to appropriate directory if BART_ROOT not set
+if [[ -z "${BART_ROOT}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  # If running from ~/.bart, use default workspace location
+  # (will be configured/confirmed during init)
+  if [[ "$SCRIPT_DIR" == "$BART_HOME" ]]; then
+    WORKSPACE_DIR="$HOME/bartlett-workspace"
+  else
+    WORKSPACE_DIR="$SCRIPT_DIR"
+  fi
+else
+  WORKSPACE_DIR="$BART_ROOT"
+fi
+
 CONFIG_FILE="${WORKSPACE_DIR}/.bart"
 CLAUDE_DIR="${WORKSPACE_DIR}/.claude"
 CLAUDE_SKILLS_DIR="${CLAUDE_DIR}/skills"
@@ -12,7 +36,7 @@ ALL_REPOS="salestrak-monorepo bartlett-component-library design-prototypes"
 VALID_ROLES=("developer" "designer" "manager" "executive")
 
 get_repos_for_role() {
-  case "$1" in
+  case "${1:-}" in
     developer)  echo "salestrak-monorepo bartlett-component-library design-prototypes" ;;
     designer)   echo "bartlett-component-library design-prototypes" ;;
     manager)    echo "bartlett-component-library" ;;
@@ -21,7 +45,7 @@ get_repos_for_role() {
 }
 
 get_full_repo() {
-  case "$1" in
+  case "${1:-}" in
     salestrak-monorepo)         echo "SalesTrak/salestrak-monorepo" ;;
     bartlett-component-library) echo "SalesTrak/bartlett-component-library" ;;
     design-prototypes)          echo "SalesTrak/design-prototypes" ;;
@@ -51,6 +75,57 @@ error()   { printf "  ${RED}✗${RESET} %s\n" "$1"; }
 step()    { printf "  ${DIM}→${RESET} %s\n" "$1"; }
 
 # ── Utility Functions ──────────────────────────────────────────────────────────
+
+check_update_notification() {
+  # Skip if running update command or if bart isn't installed
+  [[ ! -f "${BART_HOME}/bart" ]] && return
+
+  # Determine GitHub repo
+  local github_repo="SalesTrak/bartlett-workspace"
+  if [[ -d "${WORKSPACE_DIR}/.git" ]]; then
+    local remote_url
+    remote_url=$(cd "$WORKSPACE_DIR" && git remote get-url origin 2>/dev/null || true)
+    if [[ -n "$remote_url" ]]; then
+      if [[ "$remote_url" =~ github\.com[:/]([^/]+/[^/]+?)(\.git)?$ ]]; then
+        github_repo="${BASH_REMATCH[1]}"
+      fi
+    fi
+  fi
+
+  # Check bart script timestamp
+  local bart_timestamp
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    bart_timestamp=$(stat -f %m "${BART_HOME}/bart" 2>/dev/null)
+  else
+    bart_timestamp=$(stat -c %Y "${BART_HOME}/bart" 2>/dev/null)
+  fi
+
+  [[ -z "$bart_timestamp" ]] && return
+
+  # Get GitHub commit timestamp for bart
+  local commit_data
+  commit_data=$(gh api "repos/${github_repo}/commits?path=bart&per_page=1" 2>/dev/null) || return
+
+  local github_date
+  github_date=$(echo "$commit_data" | grep -o '"date": "[^"]*"' | head -1 | cut -d'"' -f4 || true)
+
+  [[ -z "$github_date" ]] && return
+
+  # Convert GitHub ISO 8601 timestamp to Unix timestamp
+  local github_timestamp
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    github_timestamp=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${github_date}" +%s 2>/dev/null)
+  else
+    github_timestamp=$(date -d "${github_date}" +%s 2>/dev/null)
+  fi
+
+  [[ -z "$github_timestamp" ]] && return
+
+  # Compare timestamps and show notification if update available
+  if [[ $github_timestamp -gt $bart_timestamp ]]; then
+    printf "\n  ${YELLOW}⚠${RESET}  Run ${BOLD}bart update${RESET} to get latest changes\n"
+  fi
+}
 
 require_tty() {
   if [[ ! -t 0 ]]; then
@@ -344,6 +419,59 @@ unclone_repo() {
 
 # ── Init Steps ────────────────────────────────────────────────────────────────
 
+step_download_workspace_files() {
+  header "Downloading Workspace Files"
+
+  # Determine GitHub repo
+  local github_repo="SalesTrak/bartlett-workspace"
+  if [[ -d "${WORKSPACE_DIR}/.git" ]]; then
+    local remote_url
+    remote_url=$(cd "$WORKSPACE_DIR" && git remote get-url origin 2>/dev/null || true)
+    if [[ -n "$remote_url" ]]; then
+      if [[ "$remote_url" =~ github\.com[:/]([^/]+/[^/]+?)(\.git)?$ ]]; then
+        github_repo="${BASH_REMATCH[1]}"
+      fi
+    fi
+  fi
+
+  step "Downloading from ${github_repo}..."
+
+  # Download CLAUDE.md
+  if gh api "repos/${github_repo}/contents/CLAUDE.md" --jq '.content' | base64 -d > "${WORKSPACE_DIR}/CLAUDE.md" 2>/dev/null; then
+    success "Downloaded CLAUDE.md"
+  else
+    warn "Could not download CLAUDE.md (may not exist in repo)"
+  fi
+
+  # Download .claude directory contents
+  mkdir -p "${WORKSPACE_DIR}/.claude"
+
+  # Get list of files in .claude directory from GitHub
+  local claude_files
+  claude_files=$(gh api "repos/${github_repo}/contents/.claude" 2>/dev/null | grep -o '"path": "[^"]*"' | cut -d'"' -f4 || true)
+
+  if [[ -n "$claude_files" ]]; then
+    while IFS= read -r file_path; do
+      if [[ -n "$file_path" ]]; then
+        local filename
+        filename=$(basename "$file_path")
+        local target_path="${WORKSPACE_DIR}/${file_path}"
+        local target_dir
+        target_dir=$(dirname "$target_path")
+
+        mkdir -p "$target_dir"
+
+        if gh api "repos/${github_repo}/contents/${file_path}" --jq '.content' | base64 -d > "$target_path" 2>/dev/null; then
+          success "Downloaded ${file_path}"
+        fi
+      fi
+    done <<< "$claude_files"
+  fi
+
+  # Create skills directory if it doesn't exist
+  mkdir -p "${WORKSPACE_DIR}/.claude/skills"
+}
+
 step_clone_repos() {
   local role
   role=$(config_get role)
@@ -365,10 +493,125 @@ cmd_init() {
   printf "\n  ${BOLD}${CYAN}bart init${RESET}\n"
   printf "  ${DIM}Bartlett workspace setup${RESET}\n"
 
+  # Check if bart should be installed globally
+  local source_bart="${BASH_SOURCE[0]}"
+  local running_from_bart_home=false
+
+  if [[ "$(cd "$(dirname "$source_bart")" && pwd)" == "$BART_HOME" ]]; then
+    running_from_bart_home=true
+  fi
+
+  if [[ ! "$running_from_bart_home" = true ]]; then
+    header "Global Installation"
+
+    if [[ -f "${BART_HOME}/bart" ]]; then
+      info "bart is already installed at ${BART_HOME}/bart"
+    else
+      info "bart is not yet installed globally"
+      if confirm "Install bart to ~/.bart so you can run it from anywhere?"; then
+        # Create ~/.bart directory
+        mkdir -p "$BART_HOME"
+        success "Created ${BART_HOME}"
+
+        # Copy bart script to ~/.bart/
+        cp "$source_bart" "${BART_HOME}/bart"
+        chmod +x "${BART_HOME}/bart"
+        success "Installed bart to ${BART_HOME}/bart"
+
+        # Detect shell and add to PATH
+        local shell_config=""
+        if [[ -n "${ZSH_VERSION:-}" ]] || [[ "${SHELL:-}" == */zsh ]]; then
+          shell_config="$HOME/.zshrc"
+        elif [[ -n "${BASH_VERSION:-}" ]] || [[ "${SHELL:-}" == */bash ]]; then
+          if [[ -f "$HOME/.bash_profile" ]]; then
+            shell_config="$HOME/.bash_profile"
+          else
+            shell_config="$HOME/.bashrc"
+          fi
+        else
+          warn "Could not detect shell configuration file"
+          info "Manually add 'export PATH=\"\$HOME/.bart:\$PATH\"' to your shell config"
+        fi
+
+        # Add ~/.bart to PATH if we detected a shell config
+        if [[ -n "$shell_config" ]]; then
+          # Check if ~/.bart is already in PATH
+          if grep -q "\$HOME/\.bart\|~/.bart\|${BART_HOME}" "$shell_config" 2>/dev/null; then
+            info "~/.bart is already in PATH"
+          else
+            echo "" >> "$shell_config"
+            echo "# Bart CLI (added by bart init)" >> "$shell_config"
+            echo "export PATH=\"\$HOME/.bart:\$PATH\"" >> "$shell_config"
+            success "Added ~/.bart to PATH in ${shell_config}"
+            info "Reload your shell later: source ${shell_config}"
+          fi
+        fi
+      else
+        info "Skipping global installation. You'll need to run ./bart from this directory."
+      fi
+    fi
+  fi
+
+  # Ensure workspace is configured
+  if [[ ! -f "$BART_CONFIG" ]] || ! grep -q "^BART_ROOT=" "$BART_CONFIG" 2>/dev/null; then
+    header "Workspace Configuration"
+
+    warn "No workspace configured yet"
+    info "Please specify the directory for your Bartlett workspace"
+    printf "\n"
+
+    local default_workspace="$HOME/bartlett-workspace"
+    printf "  ${YELLOW}?${RESET} Workspace path [${default_workspace}]: "
+    read -r workspace_input
+
+    # Use default if user just pressed enter
+    local workspace_path="${workspace_input:-$default_workspace}"
+
+    # Expand ~ to home directory if present
+    workspace_path="${workspace_path/#\~/$HOME}"
+
+    # Convert to absolute path
+    if [[ "$workspace_path" != /* ]]; then
+      workspace_path="$(cd "$(dirname "$workspace_path")" 2>/dev/null && pwd)/$(basename "$workspace_path")" || workspace_path="$HOME/$workspace_path"
+    fi
+
+    # Prevent using ~/.bart as workspace
+    if [[ "$workspace_path" == "$BART_HOME" ]]; then
+      error "Cannot use ~/.bart as workspace directory"
+      exit 1
+    fi
+
+    # Create workspace directory if it doesn't exist
+    if [[ ! -d "$workspace_path" ]]; then
+      if confirm "Directory doesn't exist. Create ${workspace_path}?"; then
+        mkdir -p "$workspace_path"
+        success "Created workspace directory"
+      else
+        error "Workspace directory is required"
+        exit 1
+      fi
+    fi
+
+    # Save to config and update WORKSPACE_DIR
+    mkdir -p "$BART_HOME"
+    echo "BART_ROOT=${workspace_path}" > "$BART_CONFIG"
+    WORKSPACE_DIR="$workspace_path"
+    # Update dependent variables
+    CONFIG_FILE="${WORKSPACE_DIR}/.bart"
+    CLAUDE_DIR="${WORKSPACE_DIR}/.claude"
+    CLAUDE_SKILLS_DIR="${CLAUDE_DIR}/skills"
+    success "Workspace configured: ${WORKSPACE_DIR}"
+    printf "\n"
+  fi
+
+  # Change to workspace directory for subsequent operations
+  cd "$WORKSPACE_DIR"
+
   step_ask_role
   step_check_prerequisites
   step_check_gh_auth
   step_check_claude_auth
+  step_download_workspace_files
   step_clone_repos
 
   config_set init_completed true
@@ -618,24 +861,363 @@ cmd_rm() {
   printf "\n"
 }
 
+cmd_update() {
+  local force_update=false
+  if [[ "${1:-}" == "--force" ]]; then
+    force_update=true
+  fi
+
+  printf "\n  ${BOLD}${CYAN}bart update${RESET}"
+  [[ $force_update == true ]] && printf " ${YELLOW}--force${RESET}"
+  printf "\n"
+  printf "  ${DIM}Check for and install updates from GitHub${RESET}\n\n"
+
+  if [[ $force_update == true ]]; then
+    header "Forcing Update"
+  else
+    header "Checking for Updates"
+  fi
+
+  # Determine GitHub repo - try to detect from git remote
+  local github_repo="SalesTrak/bartlett-workspace"
+  if [[ -d "${WORKSPACE_DIR}/.git" ]]; then
+    local remote_url
+    remote_url=$(cd "$WORKSPACE_DIR" && git remote get-url origin 2>/dev/null || true)
+    if [[ -n "$remote_url" ]]; then
+      # Extract owner/repo from various GitHub URL formats
+      if [[ "$remote_url" =~ github\.com[:/]([^/]+/[^/]+?)(\.git)?$ ]]; then
+        github_repo="${BASH_REMATCH[1]}"
+      fi
+    fi
+  fi
+
+  if [[ $force_update == true ]]; then
+    step "Forcing update from ${github_repo} (skipping timestamp checks)..."
+  else
+    step "Checking ${github_repo} for updates..."
+  fi
+
+  local updates_available=false
+  local files_to_update=()
+
+  # Helper function to check and queue a file for update
+  check_file_update() {
+    local file_path="$1"
+    local local_file="${WORKSPACE_DIR}/${file_path}"
+
+    # If force mode, always add file to update list
+    if [[ $force_update == true ]]; then
+      files_to_update+=("$file_path")
+      updates_available=true
+      return
+    fi
+
+    # Skip if local file doesn't exist (will be downloaded anyway)
+    if [[ ! -f "$local_file" ]]; then
+      files_to_update+=("$file_path")
+      return
+    fi
+
+    # Get local file timestamp
+    local local_timestamp
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      local_timestamp=$(stat -f %m "$local_file")
+    else
+      local_timestamp=$(stat -c %Y "$local_file")
+    fi
+
+    # Get GitHub commit timestamp for this file
+    local commit_data
+    commit_data=$(gh api "repos/${github_repo}/commits?path=${file_path}&per_page=1" 2>/dev/null) || return
+
+    local github_date
+    github_date=$(echo "$commit_data" | grep -o '"date": "[^"]*"' | head -1 | cut -d'"' -f4 || true)
+
+    if [[ -z "$github_date" ]]; then
+      return
+    fi
+
+    # Convert GitHub ISO 8601 timestamp to Unix timestamp
+    local github_timestamp
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      github_timestamp=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${github_date}" +%s 2>/dev/null)
+    else
+      github_timestamp=$(date -d "${github_date}" +%s 2>/dev/null)
+    fi
+
+    if [[ -z "$github_timestamp" ]]; then
+      return
+    fi
+
+    # Compare timestamps
+    if [[ $github_timestamp -gt $local_timestamp ]]; then
+      files_to_update+=("$file_path")
+      updates_available=true
+    fi
+  }
+
+  # Check bart script (only in ~/.bart, not workspace)
+  if [[ -f "${BART_HOME}/bart" ]]; then
+    # If force mode, always add bart to update list
+    if [[ $force_update == true ]]; then
+      files_to_update+=("bart")
+      updates_available=true
+    else
+      local bart_timestamp
+      if [[ "$OSTYPE" == "darwin"* ]]; then
+        bart_timestamp=$(stat -f %m "${BART_HOME}/bart")
+      else
+        bart_timestamp=$(stat -c %Y "${BART_HOME}/bart")
+      fi
+
+      local commit_data
+      commit_data=$(gh api "repos/${github_repo}/commits?path=bart&per_page=1" 2>/dev/null)
+      if [[ -n "$commit_data" ]]; then
+        local github_date
+        github_date=$(echo "$commit_data" | grep -o '"date": "[^"]*"' | head -1 | cut -d'"' -f4 || true)
+
+        if [[ -n "$github_date" ]]; then
+          local github_timestamp
+          if [[ "$OSTYPE" == "darwin"* ]]; then
+            github_timestamp=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${github_date}" +%s 2>/dev/null)
+          else
+            github_timestamp=$(date -d "${github_date}" +%s 2>/dev/null)
+          fi
+
+          if [[ -n "$github_timestamp" && $github_timestamp -gt $bart_timestamp ]]; then
+            files_to_update+=("bart")
+            updates_available=true
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  # Check CLAUDE.md
+  check_file_update "CLAUDE.md"
+
+  # Check .claude directory files (excluding skills symlinks)
+  local claude_files
+  claude_files=$(gh api "repos/${github_repo}/contents/.claude" 2>/dev/null | grep -o '"path": "[^"]*"' | cut -d'"' -f4 || true)
+
+  if [[ -n "$claude_files" ]]; then
+    while IFS= read -r file_path; do
+      if [[ -n "$file_path" && "$file_path" != *.claude/skills* ]]; then
+        check_file_update "$file_path"
+      fi
+    done <<< "$claude_files"
+  fi
+
+  # Show results
+  if [[ ${#files_to_update[@]} -eq 0 ]]; then
+    if [[ $force_update == true ]]; then
+      warn "No files found to update (bart may not be installed)"
+    else
+      success "You have the latest version!"
+    fi
+    printf "\n"
+    return
+  fi
+
+  # Show what needs updating
+  if [[ $force_update == true ]]; then
+    header "Files to Update"
+  else
+    header "Updates Available"
+    info "The following files have updates:"
+  fi
+
+  if [[ $force_update == true ]]; then
+    info "Forcing update of the following files:"
+  fi
+
+  for file in "${files_to_update[@]}"; do
+    info "  - ${file}"
+  done
+  printf "\n"
+
+  if [[ $force_update == false ]]; then
+    if ! confirm "Download and install updates?"; then
+      info "Update cancelled."
+      printf "\n"
+      return
+    fi
+  fi
+
+  # Download and install updates
+  header "Installing Updates"
+
+  for file_path in "${files_to_update[@]}"; do
+    step "Updating ${file_path}..."
+
+    local temp_file
+    temp_file=$(mktemp)
+
+    if ! gh api "repos/${github_repo}/contents/${file_path}" --jq '.content' | base64 -d > "$temp_file"; then
+      rm -f "$temp_file"
+      warn "Failed to download ${file_path}"
+      continue
+    fi
+
+    # Special handling for bart script
+    if [[ "$file_path" == "bart" ]]; then
+      # Verify the downloaded file is a valid script
+      if ! head -1 "$temp_file" | grep -q "^#!/"; then
+        rm -f "$temp_file"
+        warn "Downloaded bart file does not appear to be a valid script"
+        continue
+      fi
+
+      chmod +x "$temp_file"
+
+      # Only update the installed version at ~/.bart/bart
+      if [[ -f "${BART_HOME}/bart" ]]; then
+        cp "$temp_file" "${BART_HOME}/bart"
+        success "Updated ${BART_HOME}/bart"
+      else
+        warn "bart is not installed globally"
+        info "Run './bart install' from the workspace to install"
+      fi
+    else
+      # Regular file update
+      local target_path="${WORKSPACE_DIR}/${file_path}"
+      local target_dir
+      target_dir=$(dirname "$target_path")
+
+      mkdir -p "$target_dir"
+      cp "$temp_file" "$target_path"
+      success "Updated ${file_path}"
+    fi
+
+    rm -f "$temp_file"
+  done
+
+  header "Update Complete"
+  info "All files have been updated to the latest version"
+  printf "\n"
+}
+
+cmd_claude() {
+  printf "\n  ${BOLD}${CYAN}bart claude${RESET}\n"
+  printf "  ${DIM}Launch Claude Code in the workspace${RESET}\n\n"
+
+  # Check if claude is installed
+  if ! command -v claude &>/dev/null; then
+    error "Claude Code is not installed"
+    info "Install it with: pnpm add -g @anthropic-ai/claude-code"
+    exit 1
+  fi
+
+  # Check if workspace directory exists
+  if [[ ! -d "$WORKSPACE_DIR" ]]; then
+    error "Workspace directory not found: ${WORKSPACE_DIR}"
+    info "Run './bart init' to set up the workspace first"
+    exit 1
+  fi
+
+  info "Launching Claude Code in ${WORKSPACE_DIR}"
+  cd "$WORKSPACE_DIR" && claude
+}
+
+cmd_uninstall() {
+  require_tty uninstall
+  printf "\n  ${BOLD}${RED}bart uninstall${RESET}\n"
+  printf "  ${DIM}Remove bart from ~/.bart and PATH${RESET}\n\n"
+
+  header "Uninstall bart"
+
+  if [[ ! -f "${BART_HOME}/bart" ]]; then
+    warn "bart is not installed at ${BART_HOME}/bart"
+    printf "\n"
+    return
+  fi
+
+  warn "This will:"
+  printf "    - Delete ${BART_HOME}/bart\n"
+  printf "    - Remove ${BART_HOME} directory (if empty)\n"
+  printf "    - Remove PATH entry from shell config\n\n"
+
+  if ! confirm "Are you sure you want to uninstall bart?"; then
+    info "Uninstall cancelled."
+    printf "\n"
+    return
+  fi
+
+  # Remove bart executable
+  rm -f "${BART_HOME}/bart"
+  success "Removed ${BART_HOME}/bart"
+
+  # Remove config file
+  if [[ -f "${BART_HOME}/config" ]]; then
+    rm -f "${BART_HOME}/config"
+    success "Removed ${BART_HOME}/config"
+  fi
+
+  # Remove ~/.bart directory if empty
+  if [[ -d "$BART_HOME" ]] && [[ -z "$(ls -A "$BART_HOME")" ]]; then
+    rmdir "$BART_HOME"
+    success "Removed ${BART_HOME}"
+  elif [[ -d "$BART_HOME" ]]; then
+    warn "${BART_HOME} is not empty, leaving directory in place"
+  fi
+
+  # Detect shell config and remove PATH entry
+  local shell_config=""
+  if [[ -n "${ZSH_VERSION:-}" ]] || [[ "${SHELL:-}" == */zsh ]]; then
+    shell_config="$HOME/.zshrc"
+  elif [[ -n "${BASH_VERSION:-}" ]] || [[ "${SHELL:-}" == */bash ]]; then
+    if [[ -f "$HOME/.bash_profile" ]]; then
+      shell_config="$HOME/.bash_profile"
+    else
+      shell_config="$HOME/.bashrc"
+    fi
+  fi
+
+  # Remove PATH entry
+  if [[ -n "$shell_config" && -f "$shell_config" ]]; then
+    # Create a backup
+    cp "$shell_config" "${shell_config}.backup"
+
+    # Remove the bart PATH entry and the comment line
+    sed -i.tmp '/# Bart CLI (added by/d; /export PATH="$HOME\/.bart:$PATH"/d; /export PATH="\$HOME\/.bart:\$PATH"/d' "$shell_config"
+    rm -f "${shell_config}.tmp"
+
+    success "Removed PATH entry from ${shell_config}"
+    info "Backup saved to ${shell_config}.backup"
+  fi
+
+  header "Uninstall Complete"
+  info "Reload your shell to apply changes"
+  printf "\n"
+}
+
 cmd_help() {
   printf "\n  ${BOLD}bart${RESET} — Bartlett Workspace Manager\n\n"
   printf "  ${BOLD}Usage:${RESET}\n"
-  printf "    ./bart <command>\n\n"
+  printf "    bart <command>\n\n"
   printf "  ${BOLD}Commands:${RESET}\n"
-  printf "    init    Set up the workspace (role, tools, repos, skills)\n"
-  printf "    list    Show all repos and their status\n"
-  printf "    clone   Clone a repo and link its skills\n"
-  printf "    rm      Remove a repo and unlink its skills\n"
-  printf "    reset   Remove all repos, symlinks, and config\n"
-  printf "    help    Show this help message\n\n"
+  printf "    init      Set up bart globally and workspace (role, tools, repos, skills)\n"
+  printf "    update    Check for and install updates from GitHub\n"
+  printf "              --force   Force update without timestamp check\n"
+  printf "    list      Show all repos and their status\n"
+  printf "    clone     Clone a repo and link its skills\n"
+  printf "    rm        Remove a repo and unlink its skills\n"
+  printf "    reset     Remove all repos, symlinks, and config\n"
+  printf "    claude    Launch Claude Code in the workspace\n"
+  printf "    uninstall Remove bart from ~/.bart and PATH\n"
+  printf "    help      Show this help message\n\n"
   printf "  ${BOLD}Examples:${RESET}\n"
-  printf "    ./bart clone                    Interactive repo picker\n"
-  printf "    ./bart clone salestrak-monorepo Clone a specific repo\n"
-  printf "    ./bart clone --all              Clone all repos\n"
-  printf "    ./bart rm                       Interactive repo picker\n"
-  printf "    ./bart rm salestrak-monorepo    Remove a specific repo\n"
-  printf "    ./bart rm --all                 Remove all repos\n\n"
+  printf "    bart init                       Initialize bart and workspace\n"
+  printf "    bart update                     Check for updates from GitHub\n"
+  printf "    bart update --force             Force update all files\n"
+  printf "    bart clone                      Interactive repo picker\n"
+  printf "    bart clone salestrak-monorepo   Clone a specific repo\n"
+  printf "    bart clone --all                Clone all repos\n"
+  printf "    bart rm                         Interactive repo picker\n"
+  printf "    bart rm salestrak-monorepo      Remove a specific repo\n"
+  printf "    bart rm --all                   Remove all repos\n"
+  printf "    bart claude                     Launch Claude Code in workspace\n"
+  printf "    bart uninstall                  Uninstall bart\n\n"
 }
 
 # ── Main Entry Point ──────────────────────────────────────────────────────────
@@ -644,12 +1226,20 @@ main() {
   local cmd="${1:-help}"
   shift || true
 
+  # Check for updates and show notification (skip for update command itself)
+  if [[ "$cmd" != "update" ]]; then
+    check_update_notification
+  fi
+
   case "$cmd" in
     init)           cmd_init "$@" ;;
+    uninstall)      cmd_uninstall "$@" ;;
+    update)         cmd_update "$@" ;;
     list|ls)        cmd_list "$@" ;;
     clone)          cmd_clone "$@" ;;
     rm)             cmd_rm "$@" ;;
     reset)          cmd_reset "$@" ;;
+    claude)         cmd_claude "$@" ;;
     help|--help|-h) cmd_help ;;
     *)
       error "Unknown command: ${cmd}"
