@@ -1120,6 +1120,8 @@ cmd_update() {
   # Download and install updates
   header "Installing Updates"
 
+  local bart_updated=false
+
   for file_path in "${files_to_update[@]}"; do
     step "Updating ${file_path}..."
 
@@ -1147,10 +1149,12 @@ cmd_update() {
       if [[ -f "${BART_HOME}/bart" ]]; then
         cp "$temp_file" "${BART_HOME}/bart"
         success "Updated ${BART_HOME}/bart"
+        bart_updated=true
       else
         warn "bart is not installed globally"
         info "Run './bart install' from the workspace to install"
       fi
+      rm -f "$temp_file"
     else
       # Regular file update
       local target_path="${WORKSPACE_DIR}/${file_path}"
@@ -1160,10 +1164,18 @@ cmd_update() {
       mkdir -p "$target_dir"
       cp "$temp_file" "$target_path"
       success "Updated ${file_path}"
+      rm -f "$temp_file"
     fi
-
-    rm -f "$temp_file"
   done
+
+  # If bart was updated, exit immediately to avoid script corruption
+  # (the running script's file has been replaced, so we must not read any more from it)
+  if [[ $bart_updated == true ]]; then
+    header "Update Complete"
+    info "All files have been updated to the latest version"
+    printf "\n"
+    exit 0
+  fi
 
   header "Update Complete"
   info "All files have been updated to the latest version"
