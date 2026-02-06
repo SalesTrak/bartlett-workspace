@@ -145,18 +145,15 @@ check_update_notification() {
 }
 
 require_tty() {
-  if [[ ! -t 0 ]]; then
-    error "This command requires an interactive terminal."
-    error "Please run './bart ${1:-}' directly in your terminal."
-    exit 1
-  fi
+  # Non-interactive mode - no TTY required
+  return 0
 }
 
 confirm() {
   local prompt="${1:-Continue?}"
-  printf "  ${YELLOW}?${RESET} %s [Y/n] " "$prompt"
-  read -r response
-  [[ -z "$response" || "$response" =~ ^[Yy] ]]
+  # Non-interactive mode - always return true (auto-accept)
+  info "${prompt} (auto-accepted)"
+  return 0
 }
 
 config_get() {
@@ -186,30 +183,29 @@ step_ask_role() {
 
   if [[ -n "$existing_role" ]]; then
     info "Current role: ${BOLD}${existing_role}${RESET}"
-    if ! confirm "Change your role?"; then
-      success "Keeping role: ${existing_role}"
-      return
-    fi
+    success "Keeping role: ${existing_role}"
+    return
   fi
 
-  printf "  Select your role:\n\n"
-  printf "    ${BOLD}1)${RESET} developer\n"
-  printf "    ${BOLD}2)${RESET} designer\n"
-  printf "    ${BOLD}3)${RESET} manager\n"
-  printf "    ${BOLD}4)${RESET} executive\n\n"
+  # Non-interactive mode: use BART_ROLE environment variable or default to developer
+  local role="${BART_ROLE:-developer}"
 
-  local choice
-  while true; do
-    printf "  ${YELLOW}?${RESET} Enter choice [1-4]: "
-    read -r choice
-    case "$choice" in
-      1) config_set role "developer";  success "Role set to: developer";  break ;;
-      2) config_set role "designer";   success "Role set to: designer";   break ;;
-      3) config_set role "manager";    success "Role set to: manager";    break ;;
-      4) config_set role "executive";  success "Role set to: executive";  break ;;
-      *) warn "Invalid choice. Please enter 1, 2, 3, or 4." ;;
-    esac
+  # Validate role
+  local valid=false
+  for valid_role in "${VALID_ROLES[@]}"; do
+    if [[ "$role" == "$valid_role" ]]; then
+      valid=true
+      break
+    fi
   done
+
+  if [[ "$valid" == false ]]; then
+    warn "Invalid role '${role}'. Defaulting to 'developer'"
+    role="developer"
+  fi
+
+  config_set role "$role"
+  success "Role set to: ${role} (use BART_ROLE env var to change)"
 }
 
 # ── Step 2: Check Prerequisites ───────────────────────────────────────────────
@@ -275,59 +271,19 @@ step_check_gh_auth() {
   active_account=$(echo "$status_output" | grep -B2 'Active account: true' | sed -E -n 's/.*(account|as) ([^ (]+).*/\2/p' | head -1)
 
   if [[ ${#accounts[@]} -eq 0 ]]; then
-    warn "No GitHub accounts found"
-    if confirm "Run 'gh auth login' to authenticate?"; then
-      gh auth login
-      if gh auth status &>/dev/null; then
-        success "GitHub authentication complete"
-      else
-        error "GitHub authentication failed. Please run 'gh auth login' manually."
-        exit 1
-      fi
-    else
-      error "GitHub authentication is required for cloning repos."
-      exit 1
-    fi
-    return
+    error "No GitHub accounts found"
+    error "GitHub authentication is required for cloning repos."
+    error "Please run 'gh auth login' manually before running 'bart init'"
+    exit 1
   fi
 
-  printf "  Authenticated GitHub accounts:\n\n"
-  local i=1
-  for acct in "${accounts[@]}"; do
-    local active_marker=""
-    if [[ "$acct" == "$active_account" ]]; then
-      active_marker=" ${GREEN}(active)${RESET}"
-    fi
-    printf "    ${BOLD}${i})${RESET} %s%b\n" "$acct" "$active_marker"
-    i=$((i + 1))
-  done
-  printf "    ${BOLD}${i})${RESET} Log in to a different account\n\n"
-
-  local choice
-  while true; do
-    printf "  ${YELLOW}?${RESET} Select account to use [1-${i}]: "
-    read -r choice
-    if [[ "$choice" -ge 1 && "$choice" -le ${#accounts[@]} ]] 2>/dev/null; then
-      local selected="${accounts[$((choice - 1))]}"
-      if [[ "$selected" != "$active_account" ]]; then
-        step "Switching to ${selected}..."
-        gh auth switch -u "$selected" 2>/dev/null || true
-      fi
-      success "Using GitHub account: ${selected}"
-      break
-    elif [[ "$choice" -eq $i ]] 2>/dev/null; then
-      gh auth login
-      if gh auth status &>/dev/null; then
-        success "GitHub authentication complete"
-      else
-        error "GitHub authentication failed. Please run 'gh auth login' manually."
-        exit 1
-      fi
-      break
-    else
-      warn "Invalid choice."
-    fi
-  done
+  # Non-interactive mode: use active account
+  if [[ -n "$active_account" ]]; then
+    success "Using GitHub account: ${active_account}"
+  else
+    # Use first account if no active account found
+    success "Using GitHub account: ${accounts[0]}"
+  fi
 }
 
 # ── Step 4: Check Claude Code Auth ────────────────────────────────────────────
@@ -340,12 +296,7 @@ step_check_claude_auth() {
 
   if echo "$output" | grep -qi "auth\|login\|sign in\|API key\|not authenticated\|unauthorized"; then
     warn "Claude Code does not appear to be authenticated"
-    info "Please run 'claude' interactively to complete authentication."
-    if confirm "Open Claude Code interactively now?"; then
-      claude
-    else
-      warn "Skipping — you can authenticate later by running 'claude'"
-    fi
+    warn "You can authenticate later by running 'claude' interactively"
   else
     success "Claude Code is authenticated"
   fi
@@ -524,47 +475,45 @@ cmd_init() {
     if [[ -f "${BART_HOME}/bart" ]]; then
       info "bart is already installed at ${BART_HOME}/bart"
     else
-      info "bart is not yet installed globally"
-      if confirm "Install bart to ~/.bart so you can run it from anywhere?"; then
-        # Create ~/.bart directory
-        mkdir -p "$BART_HOME"
-        success "Created ${BART_HOME}"
+      # Non-interactive mode: automatically install bart globally
+      info "Installing bart to ~/.bart"
 
-        # Copy bart script to ~/.bart/
-        cp "$source_bart" "${BART_HOME}/bart"
-        chmod +x "${BART_HOME}/bart"
-        success "Installed bart to ${BART_HOME}/bart"
+      # Create ~/.bart directory
+      mkdir -p "$BART_HOME"
+      success "Created ${BART_HOME}"
 
-        # Detect shell and add to PATH
-        local shell_config=""
-        if [[ -n "${ZSH_VERSION:-}" ]] || [[ "${SHELL:-}" == */zsh ]]; then
-          shell_config="$HOME/.zshrc"
-        elif [[ -n "${BASH_VERSION:-}" ]] || [[ "${SHELL:-}" == */bash ]]; then
-          if [[ -f "$HOME/.bash_profile" ]]; then
-            shell_config="$HOME/.bash_profile"
-          else
-            shell_config="$HOME/.bashrc"
-          fi
+      # Copy bart script to ~/.bart/
+      cp "$source_bart" "${BART_HOME}/bart"
+      chmod +x "${BART_HOME}/bart"
+      success "Installed bart to ${BART_HOME}/bart"
+
+      # Detect shell and add to PATH
+      local shell_config=""
+      if [[ -n "${ZSH_VERSION:-}" ]] || [[ "${SHELL:-}" == */zsh ]]; then
+        shell_config="$HOME/.zshrc"
+      elif [[ -n "${BASH_VERSION:-}" ]] || [[ "${SHELL:-}" == */bash ]]; then
+        if [[ -f "$HOME/.bash_profile" ]]; then
+          shell_config="$HOME/.bash_profile"
         else
-          warn "Could not detect shell configuration file"
-          info "Manually add 'export PATH=\"\$HOME/.bart:\$PATH\"' to your shell config"
-        fi
-
-        # Add ~/.bart to PATH if we detected a shell config
-        if [[ -n "$shell_config" ]]; then
-          # Check if ~/.bart is already in PATH
-          if grep -q "\$HOME/\.bart\|~/.bart\|${BART_HOME}" "$shell_config" 2>/dev/null; then
-            info "~/.bart is already in PATH"
-          else
-            echo "" >> "$shell_config"
-            echo "# Bart CLI (added by bart init)" >> "$shell_config"
-            echo "export PATH=\"\$HOME/.bart:\$PATH\"" >> "$shell_config"
-            success "Added ~/.bart to PATH in ${shell_config}"
-            info "Reload your shell later: source ${shell_config}"
-          fi
+          shell_config="$HOME/.bashrc"
         fi
       else
-        info "Skipping global installation. You'll need to run ./bart from this directory."
+        warn "Could not detect shell configuration file"
+        info "Manually add 'export PATH=\"\$HOME/.bart:\$PATH\"' to your shell config"
+      fi
+
+      # Add ~/.bart to PATH if we detected a shell config
+      if [[ -n "$shell_config" ]]; then
+        # Check if ~/.bart is already in PATH
+        if grep -q "\$HOME/\.bart\|~/.bart\|${BART_HOME}" "$shell_config" 2>/dev/null; then
+          info "~/.bart is already in PATH"
+        else
+          echo "" >> "$shell_config"
+          echo "# Bart CLI (added by bart init)" >> "$shell_config"
+          echo "export PATH=\"\$HOME/.bart:\$PATH\"" >> "$shell_config"
+          success "Added ~/.bart to PATH in ${shell_config}"
+          info "Reload your shell later: source ${shell_config}"
+        fi
       fi
     fi
   fi
@@ -573,16 +522,11 @@ cmd_init() {
   if [[ ! -f "$BART_CONFIG" ]] || ! grep -q "^BART_ROOT=" "$BART_CONFIG" 2>/dev/null; then
     header "Workspace Configuration"
 
-    warn "No workspace configured yet"
-    info "Please specify the directory for your Bartlett workspace"
-    printf "\n"
-
+    # Non-interactive mode: use BART_WORKSPACE env var or default
     local default_workspace="$HOME/bartlett-workspace"
-    printf "  ${YELLOW}?${RESET} Workspace path [${default_workspace}]: "
-    read -r workspace_input
+    local workspace_path="${BART_WORKSPACE:-$default_workspace}"
 
-    # Use default if user just pressed enter
-    local workspace_path="${workspace_input:-$default_workspace}"
+    info "Using workspace path: ${workspace_path}"
 
     # Expand ~ to home directory if present
     workspace_path="${workspace_path/#\~/$HOME}"
@@ -600,13 +544,9 @@ cmd_init() {
 
     # Create workspace directory if it doesn't exist
     if [[ ! -d "$workspace_path" ]]; then
-      if confirm "Directory doesn't exist. Create ${workspace_path}?"; then
-        mkdir -p "$workspace_path"
-        success "Created workspace directory"
-      else
-        error "Workspace directory is required"
-        exit 1
-      fi
+      info "Creating workspace directory: ${workspace_path}"
+      mkdir -p "$workspace_path"
+      success "Created workspace directory"
     fi
 
     # Save to config and update WORKSPACE_DIR
